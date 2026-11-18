@@ -15,6 +15,7 @@ The announcement describes 25 computational-biology ML tasks. The method page di
 - Six new task briefs with deterministic synthetic data. They are motivated by broad categories named publicly, but their data, labels, baselines, and graders are implemented here.
 - Tool access limited to a per-task workspace and no browser/search tool during a run. Model API access goes only through the gateway client.
 - A provider-neutral OpenAI-compatible gateway adapter, tested with `anthropic/claude-haiku-5.5`.
+- An in-process reference evaluator (`bioagent_bench reference`) that runs the documented baseline, a basic heuristic, a conventional non-agent ML reference, and the sealed oracle through the production validator and scorer. It fails fast when a seed violates the baseline=0/oracle=100 calibration invariants, so those identities are claimed only for nondegenerate calibrated seeds. v0.2 calibration details and observed envelopes are in [CALIBRATION.md](CALIBRATION.md).
 
 ## Deliberate differences
 
