@@ -26,11 +26,29 @@ import sys
 import time
 from pathlib import Path
 
-__all__ = ["TASK_IDS", "generate_bank", "grade_task"]
+__all__ = [
+    "BANK_VERSION",
+    "BankMetadataError",
+    "TASK_IDS",
+    "generate_bank",
+    "grade_task",
+    "read_bank_metadata",
+    "validate_bank",
+]
 
 TASK_IDS = ("B01", "B02", "B03", "B04", "B05", "B06")
 
+# Single source of truth for the generated-bank format.  Bump this whenever the
+# on-disk task schema or generation semantics change so stale banks are rejected
+# instead of silently reused.
+BANK_VERSION = "0.2.0"
+BANK_METADATA_FILENAME = "bank.json"
+
 _ALPHABET = "ACDEFGHIKLMNPQRSTVWY"
+
+
+class BankMetadataError(RuntimeError):
+    """Raised when a generated bank is missing or incompatible."""
 
 
 # ---------------------------------------------------------------------------
@@ -59,6 +77,25 @@ def _mean(values):
     if not values:
         return 0.0
     return sum(values) / float(len(values))
+
+
+def _rank_normalize(values):
+    """Return average ranks scaled to [0, 1], with deterministic tie handling."""
+    count = len(values)
+    if count <= 1:
+        return [0.0] * count
+    order = sorted(range(count), key=lambda index: (values[index], index))
+    ranks = [0.0] * count
+    start = 0
+    while start < count:
+        end = start
+        while end + 1 < count and values[order[end + 1]] == values[order[start]]:
+            end += 1
+        average = 0.5 * (start + end)
+        for position in range(start, end + 1):
+            ranks[order[position]] = average / float(count - 1)
+        start = end + 1
+    return ranks
 
 
 def _rmse(predicted, truth):
@@ -241,9 +278,8 @@ held-out families F07-F09. The graded input is larger than the public
 development input.
 
 ## Signal
-Binding depends on short sequence motifs, family context, and interactions
-between motifs. One-hot or k-mer encodings of the sequence are useful; family is
-a categorical feature.
+Binding depends on sequence context, family context, and interactions between
+sequence features. Sequence-derived features and the family label are useful.
 
 ## Deliverable
 Create `pipeline/predict.sh`. It is invoked from the attempt directory as:
@@ -543,97 +579,118 @@ clamped to [0, 100]. A model no better than the additive baseline scores 0.
 
 
 def _gen_b03(rng):
-    length = 30
+    length = rng.randint(48, 60)
     ancestor = [rng.choice(_ALPHABET) for _ in range(length)]
-    families = ["fam%02d" % i for i in range(1, 9)]
-    founders = {}
-    for family in families:
-        sequence = list(ancestor)
-        for _ in range(rng.randint(4, 6)):
-            position = rng.randrange(length)
-            sequence[position] = rng.choice([aa for aa in _ALPHABET if aa != sequence[position]])
-        founders[family] = "".join(sequence)
+    parent_names = ["fam%02d" % i for i in range(1, 9)]
+    parent_sequences = {}
+    daughter_sequences = {}
+    mutation_rates = {}
+
+    for parent in parent_names:
+        lineage_positions = rng.sample(range(length), 10)
+        parent_sequence = list(ancestor)
+        for position in lineage_positions:
+            choices = [aa for aa in _ALPHABET if aa != parent_sequence[position]]
+            parent_sequence[position] = rng.choice(choices)
+        parent_sequences[parent] = "".join(parent_sequence)
+
+        # Two daughter founders differ from the parent at disjoint subsets of
+        # the lineage positions.  The parent label is visible in training; the
+        # daughter labels are sealed.
+        split_positions = rng.sample(lineage_positions, 4)
+        first_positions = split_positions[:2]
+        second_positions = split_positions[2:]
+        first = list(parent_sequence)
+        for position in first_positions:
+            choices = [aa for aa in _ALPHABET if aa != first[position]]
+            first[position] = rng.choice(choices)
+        second = list(parent_sequence)
+        for position in second_positions:
+            choices = [aa for aa in _ALPHABET if aa != second[position]]
+            second[position] = rng.choice(choices)
+        daughter_sequences[parent + "a"] = "".join(first)
+        daughter_sequences[parent + "b"] = "".join(second)
+        mutation_rates[parent] = rng.uniform(0.10, 0.18)
 
     def mutate(sequence, rate):
         result = list(sequence)
         for index in range(length):
             if rng.random() < rate:
-                result[index] = rng.choice([aa for aa in _ALPHABET if aa != result[index]])
+                choices = [aa for aa in _ALPHABET if aa != result[index]]
+                result[index] = rng.choice(choices)
         return "".join(result)
 
     train_rows = []
     counter = 0
-    for family in families:
-        for _ in range(40):
+    for parent in parent_names:
+        for _ in range(32):
             counter += 1
             train_rows.append({
                 "id": "ab%05d" % counter,
-                "sequence": mutate(founders[family], 0.08),
-                "family": family,
+                "sequence": mutate(parent_sequences[parent], mutation_rates[parent]),
+                "family": parent,
             })
 
-    input_rows = []
-    input_families = []
-    for family in families:
-        for _ in range(50):
-            counter += 1
-            input_rows.append({
-                "id": "ab%05d" % counter,
-                "sequence": mutate(founders[family], 0.08),
-            })
-            input_families.append(family)
-
-    # A few exact training rows leak into the input with their original ids.
-    leak_count = max(1, int(0.08 * len(input_rows)))
-    for index in rng.sample(range(len(input_rows)), leak_count):
-        source = rng.choice(train_rows)
-        input_rows[index] = {"id": source["id"], "sequence": source["sequence"]}
-        input_families[index] = source["family"]
-
-    # A few duplicate sequences within the same family.
-    duplicate_count = max(1, int(0.05 * len(input_rows)))
-    for index in rng.sample(range(len(input_rows)), duplicate_count):
-        same_family = [
-            other for other, family in enumerate(input_families)
-            if family == input_families[index] and other != index
-        ]
-        if same_family:
-            source_index = rng.choice(same_family)
-            input_rows[index]["sequence"] = input_rows[source_index]["sequence"]
-
-    # Keep input ids unique even after leaks.
-    seen = set()
-    for row in input_rows:
-        if row["id"] in seen:
-            while True:
+    # Build the stratified public/private split first, then globally shuffle the
+    # pooled test rows and assign independent random non-sequential ids.  The
+    # old implementation appended private rows daughter-by-daughter and used
+    # contiguous ids, so both `row_index // 21` and sorted-id blocks recovered
+    # the sealed partition exactly.  Ids now carry no daughter, split, or
+    # row-order information.
+    test_rows = []
+    for parent in parent_names:
+        for suffix in ("a", "b"):
+            daughter = parent + suffix
+            rows = []
+            for _ in range(30):
                 counter += 1
-                new_id = "ab%05d" % counter
-                if new_id not in seen:
-                    break
-            row["id"] = new_id
-        seen.add(row["id"])
+                rows.append({
+                    "id": "ab%05d" % counter,
+                    "sequence": mutate(daughter_sequences[daughter], mutation_rates[parent]),
+                })
+            # One occasional within-daughter duplicate with a fresh id.  There
+            # are no exact train/test sequence or id leaks.
+            counter += 1
+            source = rng.choice(rows)
+            rows.append({
+                "id": "ab%05d" % counter,
+                "sequence": source["sequence"],
+            })
+            rng.shuffle(rows)
+            for index, row in enumerate(rows):
+                row["_split"] = "public" if index < 10 else "private"
+                row["_family"] = daughter
+                test_rows.append(row)
 
-    public_rows = []
-    private_rows = []
-    private_families = []
-    family_counts = {}
-    for row, family in zip(input_rows, input_families):
-        family_counts[family] = family_counts.get(family, 0) + 1
-        if family_counts[family] <= 20:
-            public_rows.append(row)
-        else:
-            private_rows.append(row)
-            private_families.append(family)
+    rng.shuffle(test_rows)
+    # 10000-99999 cannot collide with the five-digit train ids (00001-00256).
+    id_values = rng.sample(range(10000, 100000), len(test_rows))
+    for row, value in zip(test_rows, id_values):
+        row["id"] = "ab%05d" % value
 
-    truth_rows = [
-        {"id": row["id"], "family": family}
-        for row, family in zip(private_rows, private_families)
+    public_rows = [
+        {"id": row["id"], "sequence": row["sequence"]}
+        for row in test_rows
+        if row["_split"] == "public"
     ]
+    private_rows = [
+        {"id": row["id"], "sequence": row["sequence"]}
+        for row in test_rows
+        if row["_split"] == "private"
+    ]
+    truth_rows = [
+        {"id": row["id"], "family": row["_family"]}
+        for row in test_rows
+        if row["_split"] == "private"
+    ]
+    rng.shuffle(public_rows)
+    rng.shuffle(private_rows)
+    rng.shuffle(truth_rows)
 
     return {
         "title": "Antibody family clustering",
         "category": "sequence_clustering",
-        "description": "Cluster held-out antibody sequences into their close founder families without using label names.",
+        "description": "Cluster held-out antibody sequences into unseen daughter subfamilies of known parent lineages without using label names.",
         "batch_invariant": False,
         "train_fields": ["id", "sequence", "family"],
         "train_rows": train_rows,
@@ -653,10 +710,10 @@ def _brief_b03():
 **Batch-invariance check:** no
 
 ## Goal
-Assign each held-out antibody sequence to a family. Training data contains
-labeled sequences from eight close founder families. The graded input contains
-held-out rows from the same families, plus a few duplicate sequences and a few
-leaked ids that also appear in training.
+Assign each held-out antibody sequence to its subfamily. Training data contains
+labeled sequences from eight parent lineages. Each parent lineage has two
+unseen daughter subfamilies in the graded input, so the graded partition has
+sixteen true groups even though training exposes only eight parent labels.
 
 ## Files
 You develop against the public copies:
@@ -675,17 +732,28 @@ your `pipeline/`. The grader passes an absolute `INPUT_DIR` containing:
 `train.csv`:
 
 - `id` - unique row id (string).
-- `sequence` - 30-residue amino-acid sequence (uppercase one-letter codes).
-- `family` - family label (categorical).
+- `sequence` - amino-acid sequence of length 48-60 (uppercase one-letter codes).
+- `family` - parent-lineage label (categorical).
 
 `input.csv`:
 
 - `id`, `sequence` - same schema, no `family`.
 
 ## Split
-Training rows are 40 labeled sequences per family. Development and graded rows
-are held-out sequences from the same eight families. The graded input is larger
-than the public development input.
+Training rows are 32 labeled sequences per parent lineage. Development and
+graded rows are held-out sequences from the two unseen daughter subfamilies of
+each parent. Both the public development input and the larger graded input
+contain rows from all sixteen daughters. A small number of within-daughter
+duplicate sequences may appear with fresh ids; there are no exact training-row
+leaks.
+
+## Signal
+Sequences from the same parent lineage share lineage-specific positions, and
+the two daughters of a lineage differ at a subset of those positions. A
+reasonable approach is to assign each input sequence broadly to its nearest
+parent lineage using the training rows, then cluster the sequences assigned to
+each lineage into two groups (for example with two medoids or a centroid
+split). Label names are arbitrary.
 
 ## Output
 Create `pipeline/predict.sh`. It is invoked from the attempt directory as:
@@ -719,15 +787,14 @@ It must read `INPUT_DIR/train.csv` and `INPUT_DIR/input.csv` and write
 
 ## Scoring
 The score uses the Adjusted Rand Index (ARI) between your partition and the
-sealed family labels. The baseline is the best single Hamming-distance cutoff
-clustering on the input sequences. If that baseline ARI is below 0.98, the score
-is:
+sealed daughter labels. The baseline is the best single Hamming-distance cutoff
+clustering on the input sequences. The score is:
 
     100 * (model_ari - baseline_ari) / (1 - baseline_ari)
 
-clamped to [0, 100]. If the best cutoff baseline is at least 0.98, the score is
-`100 * model_ari` with an explicit baseline of zero. Label names are never
-compared.
+clamped to [0, 100]. Label names are never compared. If the baseline is
+degenerate (ARI at or above 1), the task reports a calibration error instead of
+rescaling.
 """
 
 
@@ -939,13 +1006,24 @@ gene-mean baseline (blank labels ignored, global mean fallback):
 
     forecast = clamp((baseline_rmse - model_rmse) / baseline_rmse, 0, 1)
 
-The panel component is the mean true dependency of your 20 selected pairs
-divided by the mean of the best feasible 20-pair panel (at most 2 per gene),
-clamped to [0, 1]. The final score is:
+The panel component compares your 20 selected pairs with a baseline panel and
+the best feasible oracle panel. The baseline panel is exactly 20 ids selected
+from the input using train-only gene-mean predictions, with at most 2 ids per
+gene and deterministic id tie-breaking. The oracle panel is the best feasible
+20-pair panel using sealed truth, also with at most 2 ids per gene:
 
-    100 * forecast * panel_ratio
+    panel_skill = clamp(
+        (selected_mean - baseline_panel_mean) / (oracle_mean - baseline_panel_mean),
+        0, 1)
 
-clamped to [0, 100]. Both a good forecast and a good panel are required.
+The final score is the equal-weight additive combination:
+
+    100 * (0.5 * forecast + 0.5 * panel_skill)
+
+clamped to [0, 100]. A model that exactly reproduces the baseline predictions
+and baseline panel scores 0; a model that exactly reproduces the truth and
+oracle panel scores 100. A perfect forecast with the baseline panel scores 50,
+and the baseline forecast with the oracle panel scores 50.
 """
 
 
@@ -955,41 +1033,130 @@ clamped to [0, 100]. Both a good forecast and a good panel are required.
 
 
 def _gen_b05(rng):
-    train_targets = ["T%02d" % i for i in range(1, 41)]
-    test_targets = ["T%02d" % i for i in range(41, 71)]
-    dev_targets = ["T%02d" % i for i in range(71, 81)]
+    target_types = ["kinase", "protease", "gpcr", "phosphatase", "nuclear"]
+    train_targets = ["T%02d" % i for i in range(1, 51)]
+    dev_targets = ["T%02d" % i for i in range(51, 61)]
+    test_targets = ["T%02d" % i for i in range(61, 91)]
+
+    def assign_types(targets, per_type):
+        values = []
+        for target_type in target_types:
+            values.extend([target_type] * per_type)
+        rng.shuffle(values)
+        return dict(zip(targets, values))
+
+    target_type = {}
+    target_type.update(assign_types(train_targets, 10))
+    target_type.update(assign_types(dev_targets, 2))
+    target_type.update(assign_types(test_targets, 6))
+
+    # Each target_type has a different relationship between within-target
+    # relative pose features and quality.
+    type_coefficients = {}
+    for target_type_name in target_types:
+        coefficients = {
+            "shape": 1.2 + rng.gauss(0.0, 0.55),
+            "hbond": 0.9 + rng.gauss(0.0, 0.55),
+            "buried": 0.8 + rng.gauss(0.0, 0.55),
+            "clash": -1.0 + rng.gauss(0.0, 0.55),
+            "energy": 0.4 + rng.gauss(0.0, 0.55),
+            "shape_buried": rng.gauss(0.0, 0.8),
+            "hbond_clash": rng.gauss(0.0, 0.8),
+        }
+        type_coefficients[target_type_name] = (rng.gauss(0.0, 0.5), coefficients)
+
+    target_parameters = {}
+    for target in train_targets + dev_targets + test_targets:
+        target_parameters[target] = {
+            "energy_offset": rng.gauss(0.0, 2.5),
+            "energy_scale": rng.uniform(0.6, 1.6),
+            "shape_offset": rng.gauss(0.0, 0.25),
+            "shape_scale": rng.uniform(0.5, 1.5),
+            "hbond_offset": rng.gauss(0.0, 3.0),
+            "hbond_scale": rng.uniform(0.5, 1.5),
+            "buried_offset": rng.gauss(0.0, 0.2),
+            "buried_scale": rng.uniform(0.5, 1.5),
+            "clash_offset": rng.gauss(0.0, 1.5),
+            "clash_scale": rng.uniform(0.5, 1.5),
+        }
 
     def make_target_rows(target, prefix, counter_start, labeled):
         rows = []
         truth = []
-        offset = rng.gauss(0.0, 0.30)
-        for pose in range(1, 9):
-            energy = rng.gauss(-8.0, 2.0)
-            shape = rng.uniform(0.0, 1.0)
-            hbond = rng.randint(0, 10)
-            buried = rng.uniform(0.0, 1.0)
-            clash = rng.randint(0, 5)
-            if rng.random() < 0.25:
-                energy -= 2.0
-                clash += rng.randint(2, 4)
-            quality = _sigmoid(
-                2.0 * shape
-                + 0.15 * hbond
-                - 0.35 * clash
-                + 0.8 * buried
-                - 0.25 * abs(energy + 8.0)
-                + offset
-                + rng.gauss(0.0, 0.15)
+        parameters = target_parameters[target]
+        raw = []
+        for pose in range(1, 13):
+            energy = rng.gauss(-8.0, 2.0) * parameters["energy_scale"] + parameters["energy_offset"]
+            shape = _clamp(
+                rng.gauss(0.5, 0.2) * parameters["shape_scale"] + parameters["shape_offset"],
+                0.0, 1.0,
             )
+            hbond = int(round(_clamp(
+                rng.gauss(5.0, 2.5) * parameters["hbond_scale"] + parameters["hbond_offset"],
+                0.0, 12.0,
+            )))
+            buried = _clamp(
+                rng.gauss(0.5, 0.2) * parameters["buried_scale"] + parameters["buried_offset"],
+                0.0, 1.0,
+            )
+            clash = int(round(_clamp(
+                rng.gauss(1.0, 1.2) * parameters["clash_scale"] + parameters["clash_offset"],
+                0.0, 8.0,
+            )))
+            if rng.random() < 0.25:
+                energy -= 2.5 * parameters["energy_scale"]
+                clash = int(_clamp(clash + rng.randint(2, 4), 0, 8))
+            raw.append({
+                "pose_rank": pose,
+                "energy": energy,
+                "shape": shape,
+                "hbond": hbond,
+                "buried": buried,
+                "clash": clash,
+            })
+
+        # The minimum-energy pose is a decoy: give it clashes and poor
+        # complementarity so that the baseline is not accidentally the oracle.
+        min_energy_index = min(
+            range(len(raw)),
+            key=lambda index: (raw[index]["energy"], raw[index]["pose_rank"]),
+        )
+        raw[min_energy_index]["clash"] = max(raw[min_energy_index]["clash"], 6)
+        raw[min_energy_index]["shape"] = min(raw[min_energy_index]["shape"], 0.2)
+        raw[min_energy_index]["buried"] = min(raw[min_energy_index]["buried"], 0.3)
+
+        shape_rank = _rank_normalize([item["shape"] for item in raw])
+        hbond_rank = _rank_normalize([item["hbond"] for item in raw])
+        buried_rank = _rank_normalize([item["buried"] for item in raw])
+        clash_rank = _rank_normalize([item["clash"] for item in raw])
+        energy_rank = _rank_normalize([-item["energy"] for item in raw])
+        intercept, coefficients = type_coefficients[target_type[target]]
+
+        for index, item in enumerate(raw):
+            features = {
+                "shape": shape_rank[index],
+                "hbond": hbond_rank[index],
+                "buried": buried_rank[index],
+                "clash": clash_rank[index],
+                "energy": energy_rank[index],
+            }
+            logit = intercept
+            for name, value in features.items():
+                logit += coefficients[name] * value
+            logit += coefficients["shape_buried"] * features["shape"] * features["buried"]
+            logit += coefficients["hbond_clash"] * features["hbond"] * (1.0 - features["clash"])
+            logit += rng.gauss(0.0, 0.70)
+            quality = _sigmoid(logit)
             row = {
-                "id": "%s%05d" % (prefix, counter_start + pose),
+                "id": "%s%05d" % (prefix, counter_start + item["pose_rank"]),
                 "target": target,
-                "pose_rank": str(pose),
-                "energy": "%.4f" % energy,
-                "shape_complementarity": "%.4f" % shape,
-                "hbond_count": str(hbond),
-                "buried_sasa": "%.4f" % buried,
-                "clash_count": str(clash),
+                "target_type": target_type[target],
+                "pose_rank": str(item["pose_rank"]),
+                "energy": "%.4f" % item["energy"],
+                "shape_complementarity": "%.4f" % item["shape"],
+                "hbond_count": str(item["hbond"]),
+                "buried_sasa": "%.4f" % item["buried"],
+                "clash_count": str(item["clash"]),
             }
             if labeled:
                 row["quality"] = "%.6f" % quality
@@ -1002,13 +1169,13 @@ def _gen_b05(rng):
     for target in train_targets:
         rows, _ = make_target_rows(target, "dp", counter, True)
         train_rows.extend(rows)
-        counter += 8
+        counter += 12
 
     public_rows = []
     for target in dev_targets:
         rows, _ = make_target_rows(target, "dv", counter, False)
         public_rows.extend(rows)
-        counter += 8
+        counter += 12
 
     private_rows = []
     truth_rows = []
@@ -1016,21 +1183,23 @@ def _gen_b05(rng):
         rows, truth = make_target_rows(target, "dh", counter, False)
         private_rows.extend(rows)
         truth_rows.extend(truth)
-        counter += 8
+        counter += 12
 
     return {
         "title": "Docking pose ranking",
         "category": "structural_biology",
-        "description": "Rank docking poses for unseen targets and select one pose per target.",
+        "description": "Rank docking poses for unseen targets and select one pose per target using target-relative pose comparisons.",
         "batch_invariant": True,
         "train_fields": [
-            "id", "target", "pose_rank", "energy", "shape_complementarity",
-            "hbond_count", "buried_sasa", "clash_count", "quality",
+            "id", "target", "target_type", "pose_rank", "energy",
+            "shape_complementarity", "hbond_count", "buried_sasa",
+            "clash_count", "quality",
         ],
         "train_rows": train_rows,
         "input_fields": [
-            "id", "target", "pose_rank", "energy", "shape_complementarity",
-            "hbond_count", "buried_sasa", "clash_count",
+            "id", "target", "target_type", "pose_rank", "energy",
+            "shape_complementarity", "hbond_count", "buried_sasa",
+            "clash_count",
         ],
         "public_input_rows": public_rows,
         "private_input_rows": private_rows,
@@ -1048,8 +1217,8 @@ def _brief_b05():
 
 ## Goal
 Predict a pose-quality score in [0, 1] for every docking pose, then select
-exactly one pose per unseen target. Training data covers 40 targets with eight
-poses each. The graded input contains 30 unseen targets with eight poses each.
+exactly one pose per unseen target. Training data covers 50 targets with twelve
+poses each. The graded input contains 30 unseen targets with twelve poses each.
 
 ## Files
 You develop against the public copies:
@@ -1069,7 +1238,8 @@ your `pipeline/`. The grader passes an absolute `INPUT_DIR` containing:
 
 - `id` - unique pose id (string).
 - `target` - target id (categorical).
-- `pose_rank` - pose index within the target (1-8).
+- `target_type` - target regime label (categorical).
+- `pose_rank` - pose index within the target (1-12).
 - `energy` - docking energy (lower is not always better).
 - `shape_complementarity` - shape score in [0, 1].
 - `hbond_count` - number of hydrogen bonds (integer).
@@ -1082,13 +1252,17 @@ your `pipeline/`. The grader passes an absolute `INPUT_DIR` containing:
 - same columns except `quality`.
 
 ## Split
-Training rows come from 40 targets. Development and graded rows come from
-unseen targets. The graded input is larger than the public development input.
+Training rows come from 50 targets. Development and graded rows come from
+disjoint unseen targets. Every split contains all five target_type regimes. The
+graded input is larger than the public development input.
 
 ## Signal
-Quality depends on shape complementarity, hydrogen bonding, buried surface,
-clashes, and energy. The minimum-energy pose is a useful but imperfect
-baseline; some low-energy poses are decoys with clashes.
+Absolute feature values shift strongly between targets, so a single global
+mapping from raw features to quality transfers poorly. Quality depends on how a
+pose compares with the other poses for the same target, and the relationship
+differs across target_type regimes. The minimum-energy pose is a useful but
+imperfect baseline; some low-energy poses are decoys with clashes and poor
+shape or buried-surface complementarity.
 
 ## Deliverable
 Create `pipeline/predict.sh`. It is invoked from the attempt directory as:
@@ -1125,13 +1299,20 @@ It must read `INPUT_DIR/train.csv` and `INPUT_DIR/input.csv` and write
 - Each run must finish within 300 seconds.
 
 ## Scoring
-The baseline selects the minimum-energy pose per target. The oracle selects the
-highest-quality pose per target. The score is:
+For each target, the baseline is the minimum-energy pose and the oracle is the
+highest-quality pose. The per-target skill is the selected pose's quality
+improvement over the baseline divided by the oracle-minus-baseline gap:
 
-    100 * (selected_mean - baseline_mean) / (oracle_mean - baseline_mean)
+    skill = (selected_quality - baseline_quality) / (oracle_quality - baseline_quality)
 
-clamped to [0, 100]. Selecting the minimum-energy pose scores 0; selecting the
-best pose for every target scores 100.
+Each per-target skill is clamped to [-1, 1] before averaging so that targets
+with very small baseline-to-oracle gaps cannot dominate. The final score is:
+
+    100 * clamp(mean_targets(skill), 0, 1)
+
+Selecting the minimum-energy pose for every target scores 0; selecting the best
+pose for every target scores 100. Targets with a non-positive
+baseline-to-oracle gap are reported as degenerate and excluded from the mean.
 """
 
 
@@ -1343,6 +1524,7 @@ def _write_task(task_dir, task_id, data):
     (task_dir / "brief.md").write_text(data["brief"], encoding="utf-8")
     meta = {
         "id": task_id,
+        "version": BANK_VERSION,
         "title": data["title"],
         "category": data["category"],
         "description": data["description"],
@@ -1351,26 +1533,105 @@ def _write_task(task_dir, task_id, data):
     (task_dir / "task.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
 
 
+_GENERATORS = {
+    "B01": _gen_b01,
+    "B02": _gen_b02,
+    "B03": _gen_b03,
+    "B04": _gen_b04,
+    "B05": _gen_b05,
+    "B06": _gen_b06,
+}
+
+
+def _generate_task_data(task_id, seed):
+    """Return the in-memory task data for one task and seed.
+
+    The seed formula is preserved from v0.1: ``seed + 1000 * (index + 1)``
+    where ``index`` is the task's position in ``TASK_IDS``.
+    """
+    if task_id not in _GENERATORS:
+        raise ValueError("unknown task id %r" % task_id)
+    index = TASK_IDS.index(task_id)
+    rng = random.Random(seed + 1000 * (index + 1))
+    return _GENERATORS[task_id](rng)
+
+
 def generate_bank(root, seed=2026):
-    """Generate the six-task synthetic bank beneath ``root``."""
+    """Generate the six-task synthetic bank beneath ``root``.
+
+    The bank is replaced consistently: any existing ``tasks/`` tree is removed
+    before the new tasks and ``bank.json`` metadata are written.
+    """
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     tasks_root = root / "tasks"
+    if tasks_root.exists():
+        shutil.rmtree(tasks_root)
     tasks_root.mkdir(parents=True, exist_ok=True)
 
-    generators = {
-        "B01": _gen_b01,
-        "B02": _gen_b02,
-        "B03": _gen_b03,
-        "B04": _gen_b04,
-        "B05": _gen_b05,
-        "B06": _gen_b06,
-    }
-
-    for index, task_id in enumerate(TASK_IDS):
-        rng = random.Random(seed + 1000 * (index + 1))
-        data = generators[task_id](rng)
+    for task_id in TASK_IDS:
+        data = _generate_task_data(task_id, seed)
         _write_task(tasks_root / task_id, task_id, data)
+
+    metadata = {
+        "benchmark": "bioagent-bench",
+        "version": BANK_VERSION,
+        "seed": seed,
+        "task_ids": list(TASK_IDS),
+    }
+    (root / BANK_METADATA_FILENAME).write_text(
+        json.dumps(metadata, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+
+
+def read_bank_metadata(root):
+    """Read and return ``root/bank.json`` or raise :class:`BankMetadataError`."""
+    path = Path(root) / BANK_METADATA_FILENAME
+    if not path.is_file():
+        raise BankMetadataError(
+            "bank metadata is missing at %s; run "
+            "`bioagent-bench generate --force --seed <seed>`" % path
+        )
+    try:
+        metadata = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise BankMetadataError(
+            "could not read bank metadata at %s: %s; run "
+            "`bioagent-bench generate --force --seed <seed>`" % (path, exc)
+        )
+    if not isinstance(metadata, dict):
+        raise BankMetadataError(
+            "bank metadata at %s is not a JSON object; run "
+            "`bioagent-bench generate --force --seed <seed>`" % path
+        )
+    return metadata
+
+
+def validate_bank(root, expected_seed=None):
+    """Validate bank metadata and optionally the stored generation seed.
+
+    ``expected_seed=None`` validates only the format version, which is what
+    read-only listing needs.  Run paths pass the requested seed so a bank made
+    with a different seed is rejected instead of silently reused.
+    """
+    metadata = read_bank_metadata(root)
+    version = metadata.get("version")
+    if version != BANK_VERSION:
+        raise BankMetadataError(
+            "bank at %s has version %r, expected %r; run "
+            "`bioagent-bench generate --force --seed <seed>`"
+            % (root, version, BANK_VERSION)
+        )
+    if expected_seed is not None:
+        stored_seed = metadata.get("seed")
+        if stored_seed != expected_seed:
+            raise BankMetadataError(
+                "bank at %s was generated with seed %r, but seed %r was "
+                "requested; run `bioagent-bench generate --force --seed %r`"
+                % (root, stored_seed, expected_seed, expected_seed)
+            )
+    return metadata
 
 
 # ---------------------------------------------------------------------------
@@ -1495,13 +1756,60 @@ def _cluster_from_edges(count, edges):
     return [find(index) for index in range(count)]
 
 
-def _cluster_by_cutoff(sequences, cutoff):
-    edges = []
+def _pairwise_distances(sequences):
+    distances = []
     for i in range(len(sequences)):
         for j in range(i + 1, len(sequences)):
-            if _hamming_distance(sequences[i], sequences[j]) <= cutoff:
-                edges.append((i, j))
-    return _cluster_from_edges(len(sequences), edges)
+            distances.append((i, j, _hamming_distance(sequences[i], sequences[j])))
+    return distances
+
+
+def _cluster_from_distances(count, distances, cutoff):
+    edges = [(i, j) for i, j, distance in distances if distance <= cutoff]
+    return _cluster_from_edges(count, edges)
+
+
+def _cluster_by_cutoff(sequences, cutoff):
+    return _cluster_from_distances(
+        len(sequences),
+        _pairwise_distances(sequences),
+        cutoff,
+    )
+
+
+def _clusterings_by_cutoff(sequences):
+    """Return single-linkage labelings for every cutoff from 1 to max length.
+
+    Edges are added incrementally in distance order, so the union-find work is
+    proportional to the number of pairs rather than pairs times cutoffs.
+    """
+    count = len(sequences)
+    max_length = max(len(sequence) for sequence in sequences)
+    edges = _pairwise_distances(sequences)
+    edges.sort(key=lambda item: item[2])
+    parent = list(range(count))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first, second):
+        root_first = find(first)
+        root_second = find(second)
+        if root_first != root_second:
+            parent[root_second] = root_first
+
+    result = []
+    edge_index = 0
+    for cutoff in range(1, max_length + 1):
+        while edge_index < len(edges) and edges[edge_index][2] <= cutoff:
+            first, second, _ = edges[edge_index]
+            union(first, second)
+            edge_index += 1
+        result.append([find(index) for index in range(count)])
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1640,7 +1948,7 @@ def _score_b02(prediction_map, shortlist, input_rows, truth_rows, train_rows):
     vocabulary, coefficients = _fit_additive_baseline(train_rows)
     ids = [row["id"] for row in input_rows]
     baseline_predictions = [
-        _additive_predict(vocabulary, coefficients, row["mutations"])
+        _clamp(_additive_predict(vocabulary, coefficients, row["mutations"]), 0.0, 1.0)
         for row in input_rows
     ]
     baseline_rmse = _rmse(baseline_predictions, [truth[row_id] for row_id in ids])
@@ -1662,42 +1970,32 @@ def _score_b03(prediction_map, shortlist, input_rows, truth_rows, train_rows):
     model_ari = _adjusted_rand_index(true_labels, predicted_labels)
 
     sequences = [row["sequence"] for row in input_rows]
-    max_length = max(len(sequence) for sequence in sequences)
-    distances = []
-    for i in range(len(sequences)):
-        for j in range(i + 1, len(sequences)):
-            distances.append((i, j, _hamming_distance(sequences[i], sequences[j])))
     best_ari = -1.0
     best_cutoff = None
-    for cutoff in range(1, max_length + 1):
-        edges = [(i, j) for i, j, distance in distances if distance <= cutoff]
-        labels = _cluster_from_edges(len(sequences), edges)
+    for cutoff, labels in enumerate(_clusterings_by_cutoff(sequences), start=1):
         ari = _adjusted_rand_index(true_labels, labels)
         if ari > best_ari:
             best_ari = ari
             best_cutoff = cutoff
 
-    if best_ari >= 0.98:
-        score = 100.0 * model_ari
-        baseline_ari = 0.0
-        mode = "direct"
+    denominator = 1.0 - best_ari
+    calibration_error = denominator <= 1e-9
+    if calibration_error:
+        score = 0.0
     else:
-        score = 100.0 * (model_ari - best_ari) / (1.0 - best_ari)
-        baseline_ari = best_ari
-        mode = "rescaled"
+        score = 100.0 * (model_ari - best_ari) / denominator
     score = _clamp(score, 0.0, 100.0)
     return score, {
         "ari": round(model_ari, 6),
-        "baseline_ari": round(baseline_ari, 6),
+        "baseline_ari": round(best_ari, 6),
         "best_cutoff": best_cutoff,
-        "mode": mode,
+        "denominator": round(denominator, 6),
+        "calibration_error": calibration_error,
         "n": len(ids),
     }
 
 
-def _score_b04(prediction_map, shortlist, input_rows, truth_rows, train_rows):
-    truth = {row["id"]: float(row["dependency"]) for row in truth_rows}
-
+def _b04_gene_means(train_rows):
     gene_values = {}
     all_values = []
     for row in train_rows:
@@ -1712,15 +2010,27 @@ def _score_b04(prediction_map, shortlist, input_rows, truth_rows, train_rows):
         all_values.append(value)
     gene_mean = {gene: _mean(values) for gene, values in gene_values.items()}
     global_mean = _mean(all_values) if all_values else 0.5
+    return gene_mean, global_mean
 
-    ids = [row["id"] for row in input_rows]
-    baseline_predictions = [gene_mean.get(row["gene"], global_mean) for row in input_rows]
-    baseline_rmse = _rmse(baseline_predictions, [truth[row_id] for row_id in ids])
-    model_rmse = _rmse([prediction_map[row_id] for row_id in ids], [truth[row_id] for row_id in ids])
-    forecast = 0.0 if baseline_rmse <= 0.0 else _clamp((baseline_rmse - model_rmse) / baseline_rmse, 0.0, 1.0)
 
-    selected_mean = _mean([truth[row_id] for row_id in shortlist])
+def _b04_baseline_panel(input_rows, train_rows):
+    """Exactly 20 ids ranked by train-only gene means, at most 2 per gene."""
+    gene_mean, global_mean = _b04_gene_means(train_rows)
+    gene_of = {row["id"]: row["gene"] for row in input_rows}
+    by_gene = {}
+    for row in input_rows:
+        by_gene.setdefault(row["gene"], []).append(row["id"])
+    candidates = []
+    for gene, gene_ids in by_gene.items():
+        ordered = sorted(gene_ids, key=lambda row_id: (-gene_mean.get(gene, global_mean), row_id))
+        candidates.extend(ordered[:2])
+    candidates.sort(key=lambda row_id: (-gene_mean.get(gene_of[row_id], global_mean), row_id))
+    return candidates[:20]
 
+
+def _b04_oracle_panel(input_rows, truth_rows):
+    """Best feasible 20-pair panel using sealed truth, at most 2 per gene."""
+    truth = {row["id"]: float(row["dependency"]) for row in truth_rows}
     by_gene = {}
     for row in input_rows:
         by_gene.setdefault(row["gene"], []).append(row["id"])
@@ -1729,18 +2039,48 @@ def _score_b04(prediction_map, shortlist, input_rows, truth_rows, train_rows):
         ordered = sorted(gene_ids, key=lambda row_id: (-truth[row_id], row_id))
         candidates.extend(ordered[:2])
     candidates.sort(key=lambda row_id: (-truth[row_id], row_id))
-    oracle_ids = candidates[:20]
-    oracle_mean = _mean([truth[row_id] for row_id in oracle_ids])
+    return candidates[:20]
+
+
+def _score_b04(prediction_map, shortlist, input_rows, truth_rows, train_rows):
+    truth = {row["id"]: float(row["dependency"]) for row in truth_rows}
+    gene_mean, global_mean = _b04_gene_means(train_rows)
+
+    ids = [row["id"] for row in input_rows]
+    baseline_predictions = [gene_mean.get(row["gene"], global_mean) for row in input_rows]
+    baseline_rmse = _rmse(baseline_predictions, [truth[row_id] for row_id in ids])
+    model_rmse = _rmse([prediction_map[row_id] for row_id in ids], [truth[row_id] for row_id in ids])
+    forecast = 0.0 if baseline_rmse <= 0.0 else _clamp((baseline_rmse - model_rmse) / baseline_rmse, 0.0, 1.0)
+
+    selected_ids = list(shortlist or [])
+    selected_mean = _mean([truth[row_id] for row_id in selected_ids])
+    baseline_panel = _b04_baseline_panel(input_rows, train_rows)
+    baseline_panel_mean = _mean([truth[row_id] for row_id in baseline_panel])
+    oracle_panel = _b04_oracle_panel(input_rows, truth_rows)
+    oracle_mean = _mean([truth[row_id] for row_id in oracle_panel])
+
+    panel_denominator = oracle_mean - baseline_panel_mean
+    panel_calibration_error = panel_denominator <= 1e-9
+    if panel_calibration_error:
+        panel_skill = 0.0
+    else:
+        panel_skill = _clamp((selected_mean - baseline_panel_mean) / panel_denominator, 0.0, 1.0)
     panel_ratio = 0.0 if oracle_mean <= 0.0 else _clamp(selected_mean / oracle_mean, 0.0, 1.0)
 
-    score = _clamp(100.0 * forecast * panel_ratio, 0.0, 100.0)
+    score = 100.0 * (0.5 * forecast + 0.5 * panel_skill)
     return score, {
         "rmse": round(model_rmse, 6),
         "baseline_rmse": round(baseline_rmse, 6),
         "forecast": round(forecast, 6),
+        "panel_skill": round(panel_skill, 6),
         "selected_mean": round(selected_mean, 6),
+        "baseline_panel_mean": round(baseline_panel_mean, 6),
         "oracle_mean": round(oracle_mean, 6),
         "panel_ratio": round(panel_ratio, 6),
+        "panel_denominator": round(panel_denominator, 6),
+        "panel_calibration_error": panel_calibration_error,
+        "forecast_weight": 0.5,
+        "panel_weight": 0.5,
         "n": len(ids),
     }
 
@@ -1748,25 +2088,43 @@ def _score_b04(prediction_map, shortlist, input_rows, truth_rows, train_rows):
 def _score_b05(prediction_map, shortlist, input_rows, truth_rows, train_rows):
     truth = {row["id"]: float(row["quality"]) for row in truth_rows}
     targets = sorted(set(row["target"] for row in input_rows))
+    target_of = {row["id"]: row["target"] for row in input_rows}
+    selected_by_target = {}
+    for row_id in shortlist or []:
+        selected_by_target[target_of[row_id]] = row_id
 
-    baseline_ids = []
+    skills = []
+    baseline_values = []
     oracle_values = []
+    selected_values = []
+    degenerate = 0
     for target in targets:
         rows = [row for row in input_rows if row["target"] == target]
         baseline = min(rows, key=lambda row: (float(row["energy"]), row["id"]))
-        baseline_ids.append(baseline["id"])
-        oracle_values.append(max(truth[row["id"]] for row in rows))
+        baseline_quality = truth[baseline["id"]]
+        oracle_quality = max(truth[row["id"]] for row in rows)
+        selected_id = selected_by_target.get(target, baseline["id"])
+        selected_quality = truth[selected_id]
+        gap = oracle_quality - baseline_quality
+        if gap <= 1e-9:
+            degenerate += 1
+        else:
+            skill = (selected_quality - baseline_quality) / gap
+            skills.append(_clamp(skill, -1.0, 1.0))
+        baseline_values.append(baseline_quality)
+        oracle_values.append(oracle_quality)
+        selected_values.append(selected_quality)
 
-    baseline_mean = _mean([truth[row_id] for row_id in baseline_ids])
-    oracle_mean = _mean(oracle_values)
-    selected_mean = _mean([truth[row_id] for row_id in shortlist])
-    denominator = oracle_mean - baseline_mean
-    score = 0.0 if denominator <= 0.0 else 100.0 * (selected_mean - baseline_mean) / denominator
-    score = _clamp(score, 0.0, 100.0)
+    mean_skill = _mean(skills)
+    score = 100.0 * _clamp(mean_skill, 0.0, 1.0)
     return score, {
-        "selected_mean": round(selected_mean, 6),
-        "baseline_mean": round(baseline_mean, 6),
-        "oracle_mean": round(oracle_mean, 6),
+        "selected_mean": round(_mean(selected_values), 6),
+        "baseline_mean": round(_mean(baseline_values), 6),
+        "oracle_mean": round(_mean(oracle_values), 6),
+        "mean_skill": round(mean_skill, 6),
+        "min_skill": round(min(skills), 6) if skills else 0.0,
+        "max_skill": round(max(skills), 6) if skills else 0.0,
+        "degenerate_targets": degenerate,
         "n_targets": len(targets),
     }
 
@@ -1975,6 +2333,13 @@ def grade_task(task_dir, submission_dir, grade_dir, timeout_seconds=300):
     task_id = meta.get("id")
     if task_id not in TASK_IDS:
         result["reason"] = "unknown task id %r" % task_id
+        return result
+    if meta.get("version") != BANK_VERSION:
+        result["reason"] = (
+            "task.json version %r is not supported (expected %r); regenerate "
+            "the bank with `bioagent-bench generate --force --seed <seed>`"
+            % (meta.get("version"), BANK_VERSION)
+        )
         return result
     result["task_id"] = task_id
 

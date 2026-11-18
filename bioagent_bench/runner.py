@@ -14,7 +14,7 @@ from typing import Any, Dict, List
 
 from .agent import run_agent
 from .gateway import DEFAULT_MODEL
-from .taskbank import TASK_IDS, generate_bank, grade_task
+from .taskbank import TASK_IDS, generate_bank, grade_task, validate_bank
 
 
 def _dump(path: Path, value: Any) -> None:
@@ -26,9 +26,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def ensure_bank(bank: Path, seed: int = 2026) -> None:
+def ensure_bank(bank: Path, seed: int = None) -> Dict[str, Any]:
+    """Ensure a usable bank exists and return its metadata.
+
+    A missing bank is generated.  An existing bank must carry compatible
+    ``bank.json`` metadata; a stale v0.1 bank or a seed mismatch is rejected
+    with an explicit regeneration command instead of being silently reused.
+    ``seed=None`` validates only the format version (used by read-only listing).
+    """
+    bank = Path(bank)
     if not (bank / "tasks").is_dir():
-        generate_bank(bank, seed=seed)
+        generate_bank(bank, seed=2026 if seed is None else seed)
+    return validate_bank(bank, expected_seed=seed)
 
 
 def _zero_result(task_id: str, reason: str) -> Dict[str, Any]:
@@ -55,6 +64,7 @@ def run_suite(
     grade_time_limit: int = 300,
     max_output_tokens: int = 8192,
     run_id: str = None,
+    seed: int = None,
 ) -> Dict[str, Any]:
     tasks = task_ids or list(TASK_IDS)
     unknown = set(tasks) - set(TASK_IDS)
@@ -64,6 +74,7 @@ def run_suite(
         raise ValueError("task_ids must not contain duplicates")
     if replicates < 1:
         raise ValueError("replicates must be at least 1")
+    bank_metadata = validate_bank(bank, expected_seed=seed)
     os.environ["PATH"] = str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")
     run_id = run_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
     run_dir = output_root / run_id
@@ -79,6 +90,9 @@ def run_suite(
         "grade_time_limit_seconds": grade_time_limit,
         "max_output_tokens": max_output_tokens,
         "bank": str(bank.resolve()),
+        "bank_version": bank_metadata["version"],
+        "bank_seed": bank_metadata["seed"],
+        "bank_metadata": bank_metadata,
     }
     _dump(run_dir / "config.json", config)
     records = []

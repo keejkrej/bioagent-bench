@@ -33,6 +33,14 @@ def parser() -> argparse.ArgumentParser:
 
     tasks = subparsers.add_parser("tasks", help="List generated tasks")
     tasks.add_argument("--bank", type=Path, default=Path(".bench"))
+
+    reference = subparsers.add_parser(
+        "reference",
+        help="Run in-process baseline, simple, reference, and oracle methods",
+    )
+    reference.add_argument("--seeds", default="2026,2027,2028", help="Comma-separated integer seeds")
+    reference.add_argument("--tasks", default=",".join(TASK_IDS), help="Comma-separated task ids")
+    reference.add_argument("--output", type=Path, help="Optional JSON output path")
     return result
 
 
@@ -65,8 +73,22 @@ def main() -> None:
             grade_time_limit=args.grade_time_limit,
             max_output_tokens=args.max_output_tokens,
             run_id=args.run_id,
+            seed=args.seed,
         )
         print("\n" + json.dumps(summary, indent=2, sort_keys=True))
+        return
+    if args.command == "reference":
+        from .reference import CalibrationError, evaluate, write_report
+
+        seeds = [int(item.strip()) for item in args.seeds.split(",") if item.strip()]
+        tasks = [item.strip() for item in args.tasks.split(",") if item.strip()]
+        try:
+            result = evaluate(seeds, tasks)
+        except CalibrationError as exc:
+            raise SystemExit("calibration error: %s" % exc)
+        if args.output:
+            write_report(result, args.output)
+        print(json.dumps(result, indent=2, sort_keys=True))
         return
 
 

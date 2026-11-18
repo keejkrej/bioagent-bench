@@ -7,7 +7,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from bioagent_bench.taskbank import TASK_IDS, generate_bank, grade_task
+from bioagent_bench.taskbank import (
+    BANK_VERSION,
+    BankMetadataError,
+    TASK_IDS,
+    generate_bank,
+    grade_task,
+    read_bank_metadata,
+    validate_bank,
+)
 
 
 DUMMY_SCRIPT = r'''#!/usr/bin/env python3
@@ -155,7 +163,67 @@ class TaskBankTests(unittest.TestCase):
                     first_path = self.bank / "tasks" / task_id / relative
                     second_path = second / "tasks" / task_id / relative
                     self.assertEqual(first_path.read_bytes(), second_path.read_bytes())
+        self.assertEqual(
+            (self.bank / "bank.json").read_bytes(),
+            (second / "bank.json").read_bytes(),
+        )
         shutil.rmtree(second)
+
+    def test_generate_bank_replaces_existing_tasks_consistently(self):
+        target = self.root / "bank-replace"
+        generate_bank(target, seed=2026)
+        stale = target / "tasks" / "B01" / "stale.txt"
+        stale.write_text("stale", encoding="utf-8")
+        generate_bank(target, seed=2026)
+        self.assertFalse(stale.exists())
+        self.assertEqual(read_bank_metadata(target)["seed"], 2026)
+        shutil.rmtree(target)
+
+    def test_bank_metadata_and_task_versions_are_written(self):
+        metadata = read_bank_metadata(self.bank)
+        self.assertEqual(metadata["version"], BANK_VERSION)
+        self.assertEqual(metadata["seed"], 2026)
+        self.assertEqual(metadata["task_ids"], list(TASK_IDS))
+        self.assertEqual(validate_bank(self.bank, expected_seed=2026), metadata)
+        for task_id in TASK_IDS:
+            with self.subTest(task_id=task_id):
+                task_meta = json.loads(
+                    (self.bank / "tasks" / task_id / "task.json").read_text(encoding="utf-8")
+                )
+                self.assertEqual(task_meta["version"], BANK_VERSION)
+
+    def test_validate_bank_rejects_missing_metadata(self):
+        stale = self.root / "stale-bank"
+        (stale / "tasks").mkdir(parents=True)
+        with self.assertRaises(BankMetadataError) as context:
+            validate_bank(stale)
+        self.assertIn("generate --force", str(context.exception))
+
+    def test_validate_bank_rejects_unknown_version(self):
+        stale = self.root / "old-version-bank"
+        (stale / "tasks").mkdir(parents=True)
+        (stale / "bank.json").write_text(
+            json.dumps({"version": "0.1.0", "seed": 2026}), encoding="utf-8"
+        )
+        with self.assertRaises(BankMetadataError) as context:
+            validate_bank(stale)
+        self.assertIn("version", str(context.exception))
+        self.assertIn("generate --force", str(context.exception))
+
+    def test_validate_bank_rejects_seed_mismatch(self):
+        with self.assertRaises(BankMetadataError) as context:
+            validate_bank(self.bank, expected_seed=2027)
+        self.assertIn("seed 2027", str(context.exception))
+        self.assertIn("generate --force --seed 2027", str(context.exception))
+
+    def test_validate_bank_version_only_does_not_require_stored_seed(self):
+        other = self.root / "bank-other-seed"
+        generate_bank(other, seed=2027)
+        metadata = validate_bank(other)
+        self.assertEqual(metadata["seed"], 2027)
+        with self.assertRaises(BankMetadataError):
+            validate_bank(other, expected_seed=2026)
+        shutil.rmtree(other)
 
     def test_valid_dummy_pipeline_passes_every_gate(self):
         for task_id in TASK_IDS:
@@ -210,6 +278,19 @@ class TaskBankTests(unittest.TestCase):
         self.assertIn("None None None", result["attempts"][0]["stdout_tail"])
         for secret in secrets.values():
             self.assertNotIn(secret, json.dumps(result))
+
+    def test_grade_task_rejects_stale_task_version(self):
+        stale = self.root / "stale-task"
+        shutil.copytree(self.bank / "tasks" / "B01", stale)
+        meta = json.loads((stale / "task.json").read_text(encoding="utf-8"))
+        meta["version"] = "0.1.0"
+        (stale / "task.json").write_text(json.dumps(meta), encoding="utf-8")
+        result = grade_task(
+            stale, self.workspace("B01"), self.root / "grading-stale"
+        )
+        self.assertFalse(result["passed_gate"])
+        self.assertIn("version", result["reason"])
+        self.assertIn("generate --force", result["reason"])
 
     def test_missing_pipeline_fails_closed(self):
         empty = self.root / "empty-workspace"

@@ -1,4 +1,9 @@
-# Example Haiku 5.5 result
+# Historical v0.1 example: Haiku 5.5 result
+
+> **Historical v0.1 result.** This page records the v0.1 bank and grader. It is
+> not a v0.2 score and should not be compared with the v0.2 reference tables.
+> See [CALIBRATION.md](CALIBRATION.md) for the current v0.2 mechanisms and
+> observed reference envelope.
 
 ## Configuration
 
